@@ -1,0 +1,98 @@
+name: 'Lazaretto Scan'
+description: 'Verify npm packages, repos, skills, or files for malicious behavior before they ship. Fails the build on a bad verdict.'
+author: 'Lazaretto'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'Lazaretto API key with prepaid credits (store as a secret). Get one free with `curl -X POST https://lazaretto.dev/v1/trial`, or buy a bundle at https://lazaretto.dev/#pricing. Without it, scans cannot run and the action reports only.'
+    required: false
+    default: ''
+  targets:
+    description: 'Newline-separated targets, each "type:ref". type is one of npm_package, github_repo, clawhub_skill, raw_url. Example: "npm_package:left-pad@1.3.0". If empty, the direct dependencies in package-json are scanned.'
+    required: false
+    default: ''
+  package-json:
+    description: 'Path to a package.json whose direct dependencies to scan when `targets` is empty.'
+    required: false
+    default: 'package.json'
+  fail-on:
+    description: 'Fail the build when the worst verdict reaches this level: malicious | flagged | never.'
+    required: false
+    default: 'malicious'
+  base-url:
+    description: 'Lazaretto API base URL.'
+    required: false
+    default: 'https://lazaretto.dev'
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        LAZ_KEY: ${{ inputs.api-key }}
+        TARGETS: ${{ inputs.targets }}
+        PKG_JSON: ${{ inputs.package-json }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -uo pipefail
+
+        rank() { case "$1" in malicious) echo 3;; flagged) echo 2;; clear) echo 1;; *) echo 0;; esac; }
+
+        # Build the target list.
+        list="$(mktemp)"
+        if [ -n "${TARGETS//[[:space:]]/}" ]; then
+          printf '%s\n' "$TARGETS" | sed '/^[[:space:]]*$/d' > "$list"
+        elif [ -f "$PKG_JSON" ]; then
+          # Direct deps as npm_package:name@version, stripping a leading range operator.
+          jq -r '((.dependencies // {}) + (.devDependencies // {})) | to_entries[] | "npm_package:\(.key)@\(.value)"' "$PKG_JSON" \
+            | sed -E 's/@[[:space:]]*[\^~>=<]*[[:space:]]*/@/' > "$list"
+        fi
+
+        if [ ! -s "$list" ]; then
+          echo "Lazaretto: nothing to scan (no targets and no package.json deps)."
+          exit 0
+        fi
+
+        if [ -z "${LAZ_KEY//[[:space:]]/}" ]; then
+          echo "::warning title=Lazaretto::No api-key set. Full scans need a key. Get one free: curl -X POST ${BASE_URL}/v1/trial . Reporting only, not failing the build."
+        fi
+
+        threshold="$(rank "$FAIL_ON")"
+        worst=0; worst_v="clear"; count=0
+        summary="$(mktemp)"
+        printf '## Lazaretto scan\n\n| target | verdict | signals |\n| --- | --- | --- |\n' > "$summary"
+
+        while IFS= read -r line; do
+          [ -z "${line//[[:space:]]/}" ] && continue
+          typ="${line%%:*}"; ref="${line#*:}"
+          count=$((count+1))
+          body="$(jq -n --arg t "$typ" --arg r "$ref" '{target:{type:$t,ref:$r},depth:"full"}')"
+          if [ -n "${LAZ_KEY//[[:space:]]/}" ]; then
+            resp="$(curl -fsS -H 'content-type: application/json' -H "x-api-key: ${LAZ_KEY}" -X POST "${BASE_URL}/v1/scan" -d "$body" 2>/dev/null)" || resp='{"verdict":"error"}'
+          else
+            resp='{"verdict":"unscanned"}'
+          fi
+          v="$(printf '%s' "$resp" | jq -r '.verdict // "error"')"
+          n="$(printf '%s' "$resp" | jq -r '(.findings // []) | length')"
+          printf '| `%s:%s` | %s | %s |\n' "$typ" "$ref" "$v" "$n" >> "$summary"
+          echo "lazaretto: ${typ}:${ref} -> ${v} (${n} signals)"
+          r="$(rank "$v")"; if [ "$r" -gt "$worst" ]; then worst="$r"; worst_v="$v"; fi
+        done < "$list"
+
+        {
+          echo
+          echo "Scanned ${count} target(s). Worst verdict: **${worst_v}**. Full evidence is in each report via the API."
+          echo
+          echo "Powered by [Lazaretto](${BASE_URL})."
+        } >> "$summary"
+        [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$FAIL_ON" != "never" ] && [ "$worst" -ge "$threshold" ] && [ "$threshold" -gt 0 ]; then
+          echo "::error title=Lazaretto::Worst verdict '${worst_v}' meets the fail-on threshold '${FAIL_ON}'. Failing the build."
+          exit 1
+        fi
+        echo "lazaretto: worst verdict '${worst_v}' is below the fail-on threshold '${FAIL_ON}'. OK."
