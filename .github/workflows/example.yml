@@ -1,7 +1,13 @@
-# Example: scan direct dependencies on every push and PR. Fail on a malicious
-# verdict. Copy this into your own repo's .github/workflows/.
+# Example: on every pull request that changes dependencies, scan them and post a
+# sticky comment with the verdict. Fails the build only on a malicious verdict.
+# Copy this into your own repo's .github/workflows/.
 name: Lazaretto scan
-on: [push, pull_request]
+on:
+  pull_request:
+    paths: ['package.json', 'package-lock.json'] # only run when deps change (keeps it cheap)
+permissions:
+  contents: read
+  pull-requests: write # so the action can post its verdict comment
 jobs:
   scan:
     runs-on: ubuntu-latest

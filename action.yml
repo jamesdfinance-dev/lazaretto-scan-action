@@ -22,6 +22,14 @@ inputs:
     description: 'Fail the build when the worst verdict reaches this level: malicious | flagged | never.'
     required: false
     default: 'malicious'
+  comment:
+    description: 'On a pull request, post (and update) a sticky comment with the verdict table. Needs `pull-requests: write` permission.'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used to post the PR comment. Defaults to the workflow token.'
+    required: false
+    default: ${{ github.token }}
   base-url:
     description: 'Lazaretto API base URL.'
     required: false
@@ -36,11 +44,14 @@ runs:
         TARGETS: ${{ inputs.targets }}
         PKG_JSON: ${{ inputs.package-json }}
         FAIL_ON: ${{ inputs.fail-on }}
+        COMMENT: ${{ inputs.comment }}
+        GH_TOKEN: ${{ inputs.github-token }}
         BASE_URL: ${{ inputs.base-url }}
       run: |
         set -uo pipefail
 
         rank() { case "$1" in malicious) echo 3;; flagged) echo 2;; clear) echo 1;; *) echo 0;; esac; }
+        icon() { case "$1" in malicious) echo '🔴';; flagged) echo '🟠';; clear) echo '🟢';; error) echo '⚪';; *) echo '⚫';; esac; }
 
         # Build the target list.
         list="$(mktemp)"
@@ -63,8 +74,7 @@ runs:
 
         threshold="$(rank "$FAIL_ON")"
         worst=0; worst_v="clear"; count=0
-        summary="$(mktemp)"
-        printf '## Lazaretto scan\n\n| target | verdict | signals |\n| --- | --- | --- |\n' > "$summary"
+        rows="$(mktemp)"
 
         while IFS= read -r line; do
           [ -z "${line//[[:space:]]/}" ] && continue
@@ -78,18 +88,41 @@ runs:
           fi
           v="$(printf '%s' "$resp" | jq -r '.verdict // "error"')"
           n="$(printf '%s' "$resp" | jq -r '(.findings // []) | length')"
-          printf '| `%s:%s` | %s | %s |\n' "$typ" "$ref" "$v" "$n" >> "$summary"
+          printf '| `%s:%s` | %s %s | %s |\n' "$typ" "$ref" "$(icon "$v")" "$v" "$n" >> "$rows"
           echo "lazaretto: ${typ}:${ref} -> ${v} (${n} signals)"
           r="$(rank "$v")"; if [ "$r" -gt "$worst" ]; then worst="$r"; worst_v="$v"; fi
         done < "$list"
 
+        # Assemble the report (job summary + PR comment share this body).
+        report="$(mktemp)"
         {
+          echo "## $(icon "$worst_v") Lazaretto scan"
           echo
-          echo "Scanned ${count} target(s). Worst verdict: **${worst_v}**. Full evidence is in each report via the API."
+          echo "| target | verdict | signals |"
+          echo "| --- | --- | --- |"
+          cat "$rows"
           echo
-          echo "Powered by [Lazaretto](${BASE_URL})."
-        } >> "$summary"
-        [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Scanned **${count}** target(s). Worst verdict: **${worst_v}**. Verdicts are automated signals with evidence, not a warranty; the full evidence for each is in the report from the API."
+          echo
+          echo "<sub>Powered by [Lazaretto](${BASE_URL}) · a \`clear\` result means no known-bad match and no rule fired.</sub>"
+        } > "$report"
+        [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+        # Sticky PR comment (create or update the single Lazaretto comment).
+        if [ "${COMMENT}" = "true" ] && [ -n "${GH_TOKEN//[[:space:]]/}" ] && [ -f "${GITHUB_EVENT_PATH:-/nonexistent}" ]; then
+          pr="$(jq -r '.pull_request.number // .number // empty' "${GITHUB_EVENT_PATH}" 2>/dev/null)"
+          if [ -n "${pr}" ]; then
+            api="${GITHUB_API_URL:-https://api.github.com}"; repo="${GITHUB_REPOSITORY}"; marker="<!-- lazaretto-scan -->"
+            cbody="$(printf '%s\n%s' "$marker" "$(cat "$report")")"
+            payload="$(jq -n --arg b "$cbody" '{body:$b}')"
+            existing="$(curl -fsS -H "authorization: Bearer ${GH_TOKEN}" -H 'accept: application/vnd.github+json' "${api}/repos/${repo}/issues/${pr}/comments?per_page=100" 2>/dev/null | jq -r --arg m "$marker" 'map(select(.body // "" | contains($m))) | .[0].id // empty')"
+            if [ -n "${existing}" ]; then
+              curl -fsS -X PATCH -H "authorization: Bearer ${GH_TOKEN}" -H 'accept: application/vnd.github+json' "${api}/repos/${repo}/issues/comments/${existing}" -d "$payload" >/dev/null 2>&1 && echo "lazaretto: updated PR comment" || echo "::warning title=Lazaretto::could not update the PR comment"
+            else
+              curl -fsS -X POST -H "authorization: Bearer ${GH_TOKEN}" -H 'accept: application/vnd.github+json' "${api}/repos/${repo}/issues/${pr}/comments" -d "$payload" >/dev/null 2>&1 && echo "lazaretto: posted PR comment" || echo "::warning title=Lazaretto::could not post the PR comment (grant 'pull-requests: write')"
+            fi
+          fi
+        fi
 
         if [ "$FAIL_ON" != "never" ] && [ "$worst" -ge "$threshold" ] && [ "$threshold" -gt 0 ]; then
           echo "::error title=Lazaretto::Worst verdict '${worst_v}' meets the fail-on threshold '${FAIL_ON}'. Failing the build."
