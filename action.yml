@@ -1,21 +1,25 @@
 name: 'Lazaretto Scan'
-description: 'Verify npm packages, repos, skills, or files for malicious behavior before they ship. Fails the build on a bad verdict.'
+description: 'Fail the build when a dependency you pinned is known malware. Lockfile check needs no API key.'
 author: 'Lazaretto'
 branding:
   icon: 'shield'
   color: 'blue'
 
 inputs:
+  lockfile:
+    description: 'Path to a lockfile to check against the known-malicious package feed. "auto" finds package-lock.json, yarn.lock, or pnpm-lock.yaml in the workspace root. Set "" to skip. This check is free and needs no API key.'
+    required: false
+    default: 'auto'
   api-key:
-    description: 'Lazaretto API key with prepaid credits (store as a secret). Get one free with `curl -X POST https://lazaretto.dev/v1/trial`, or buy a bundle at https://lazaretto.dev/#pricing. Without it, scans cannot run and the action reports only.'
+    description: 'Lazaretto API key, for the OPTIONAL deep behavioral scan (store as a secret). Not needed for the lockfile check. Get one free with `curl -X POST https://lazaretto.dev/v1/trial`.'
     required: false
     default: ''
   targets:
-    description: 'Newline-separated targets, each "type:ref". type is one of npm_package, github_repo, clawhub_skill, raw_url. Example: "npm_package:left-pad@1.3.0". If empty, the direct dependencies in package-json are scanned.'
+    description: 'Newline-separated targets for the deep scan, each "type:ref". type is one of npm_package, github_repo, clawhub_skill, raw_url. Example: "npm_package:left-pad@1.3.0". Needs api-key. If empty, direct dependencies are resolved from the lockfile.'
     required: false
     default: ''
   package-json:
-    description: 'Path to a package.json whose direct dependencies to scan when `targets` is empty.'
+    description: 'package.json whose DIRECT dependencies the deep scan covers when `targets` is empty. Exact versions are read from the lockfile, never guessed from a range.'
     required: false
     default: 'package.json'
   fail-on:
@@ -23,7 +27,7 @@ inputs:
     required: false
     default: 'malicious'
   comment:
-    description: 'On a pull request, post (and update) a sticky comment with the verdict table. Needs `pull-requests: write` permission.'
+    description: 'On a pull request, post (and update) a sticky comment with the results. Needs `pull-requests: write` permission.'
     required: false
     default: 'true'
   github-token:
@@ -35,11 +39,21 @@ inputs:
     required: false
     default: 'https://lazaretto.dev'
 
+outputs:
+  malicious-count:
+    description: 'Number of pinned dependency versions found to be known malware.'
+    value: ${{ steps.laz.outputs.malicious-count }}
+  worst-verdict:
+    description: 'Worst verdict from the deep scan (malicious | flagged | clear | error | unscanned).'
+    value: ${{ steps.laz.outputs.worst-verdict }}
+
 runs:
   using: 'composite'
   steps:
-    - shell: bash
+    - id: laz
+      shell: bash
       env:
+        LOCKFILE_IN: ${{ inputs.lockfile }}
         LAZ_KEY: ${{ inputs.api-key }}
         TARGETS: ${{ inputs.targets }}
         PKG_JSON: ${{ inputs.package-json }}
@@ -53,60 +67,144 @@ runs:
         rank() { case "$1" in malicious) echo 3;; flagged) echo 2;; clear) echo 1;; *) echo 0;; esac; }
         icon() { case "$1" in malicious) echo '🔴';; flagged) echo '🟠';; clear) echo '🟢';; error) echo '⚪';; *) echo '⚫';; esac; }
 
-        # Build the target list.
+        report="$(mktemp)"; rows="$(mktemp)"; lockrows="$(mktemp)"
+        mal_count=0; lock_ran=0; lock_note=""
+
+        # ------------------------------------------------------------------
+        # 1) Lockfile check. Free, no API key, one request for the whole tree.
+        #    This is the part that catches a compromised release you actually
+        #    pinned (chalk 5.6.1, debug 4.4.2, @ledgerhq/connect-kit 1.1.6).
+        # ------------------------------------------------------------------
+        lockfile=""
+        if [ "${LOCKFILE_IN}" = "auto" ]; then
+          for f in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml; do
+            [ -f "$f" ] && { lockfile="$f"; break; }
+          done
+        elif [ -n "${LOCKFILE_IN//[[:space:]]/}" ]; then
+          lockfile="${LOCKFILE_IN}"
+          [ -f "$lockfile" ] || { echo "::warning title=Lazaretto::lockfile '${lockfile}' not found."; lockfile=""; }
+        fi
+
+        if [ -n "$lockfile" ]; then
+          case "$lockfile" in
+            *.json) ctype='application/json';;
+            *)      ctype='text/plain';;
+          esac
+          lock_resp="$(mktemp)"
+          code="$(curl -sS -o "$lock_resp" -w '%{http_code}' --max-time 120 \
+                    -X POST "${BASE_URL}/v1/lockfile" \
+                    -H "content-type: ${ctype}" --data-binary @"$lockfile" 2>/dev/null || echo 000)"
+          case "$code" in
+            200)
+              lock_ran=1
+              mal_count="$(jq -r '.malicious | length' "$lock_resp")"
+              checked="$(jq -r '.checked' "$lock_resp")"
+              unver="$(jq -r '.unverified | length' "$lock_resp")"
+              skipped="$(jq -r '.skipped.count // 0' "$lock_resp")"
+              jq -r '.malicious[] | "| `\(.name)@\(.version)` | 🔴 known malware | [\(.ids[0])](\(.advisory_url)) |"' "$lock_resp" >> "$lockrows"
+              jq -r '.unverified[] | "| `\(.name)@\(.version)` | ⚪ not verified | \(.reason) |"' "$lock_resp" >> "$lockrows"
+              lock_note="Checked **${checked}** pinned versions from \`${lockfile}\`."
+              [ "$unver" -gt 0 ] && lock_note="${lock_note} **${unver}** could not be checked, which is not an all-clear for those."
+              [ "$skipped" -gt 0 ] && lock_note="${lock_note} ${skipped} local/non-registry entr$([ "$skipped" -eq 1 ] && echo "y has" || echo "ies have") no published identity to check."
+              echo "lazaretto: ${lockfile} -> ${checked} checked, ${mal_count} malicious, ${unver} unverified, ${skipped} skipped"
+              jq -r '.malicious[] | "::error title=Lazaretto::\(.name)@\(.version) is known malware (\(.ids[0])). Remove or upgrade it."' "$lock_resp"
+              ;;
+            400)
+              echo "::warning title=Lazaretto::could not read '${lockfile}': $(jq -r '.detail // .error // "unrecognized"' "$lock_resp" 2>/dev/null)"
+              ;;
+            429)
+              echo "::warning title=Lazaretto::rate limited on the lockfile check. Not an all-clear."
+              ;;
+            *)
+              # Our outage is not the caller's build failure, but it is also not
+              # a pass: say so loudly rather than reporting a clean run.
+              echo "::warning title=Lazaretto::lockfile check unavailable (HTTP ${code}). This is NOT an all-clear."
+              ;;
+          esac
+        else
+          echo "lazaretto: no lockfile found; skipping the free known-malware check."
+        fi
+
+        # ------------------------------------------------------------------
+        # 2) Deep behavioral scan. Optional, needs a key and credits.
+        # ------------------------------------------------------------------
         list="$(mktemp)"
         if [ -n "${TARGETS//[[:space:]]/}" ]; then
           printf '%s\n' "$TARGETS" | sed '/^[[:space:]]*$/d' > "$list"
-        elif [ -f "$PKG_JSON" ]; then
-          # Direct deps as npm_package:name@version, stripping a leading range operator.
-          jq -r '((.dependencies // {}) + (.devDependencies // {})) | to_entries[] | "npm_package:\(.key)@\(.value)"' "$PKG_JSON" \
-            | sed -E 's/@[[:space:]]*[\^~>=<]*[[:space:]]*/@/' > "$list"
-        fi
-
-        if [ ! -s "$list" ]; then
-          echo "Lazaretto: nothing to scan (no targets and no package.json deps)."
-          exit 0
-        fi
-
-        if [ -z "${LAZ_KEY//[[:space:]]/}" ]; then
-          echo "::warning title=Lazaretto::No api-key set. Full scans need a key. Get one free: curl -X POST ${BASE_URL}/v1/trial . Reporting only, not failing the build."
+        elif [ -n "${LAZ_KEY//[[:space:]]/}" ] && [ -f "$PKG_JSON" ] && [ -f package-lock.json ]; then
+          # Direct deps at the versions ACTUALLY INSTALLED, read from the lock.
+          # Never derive a version by stripping a range operator: "^5.0.0" would
+          # become 5.0.0, and a verdict about 5.0.0 says nothing about the 5.6.1
+          # that npm would install. That is a report about the wrong artifact.
+          jq -r --slurpfile lock package-lock.json '
+            ((.dependencies // {}) + (.devDependencies // {})) | keys[] as $n
+            | ($lock[0].packages["node_modules/" + $n].version // empty) as $v
+            | "npm_package:\($n)@\($v)"
+          ' "$PKG_JSON" 2>/dev/null > "$list"
         fi
 
         threshold="$(rank "$FAIL_ON")"
         worst=0; worst_v="clear"; count=0
-        rows="$(mktemp)"
-
-        while IFS= read -r line; do
-          [ -z "${line//[[:space:]]/}" ] && continue
-          typ="${line%%:*}"; ref="${line#*:}"
-          count=$((count+1))
-          body="$(jq -n --arg t "$typ" --arg r "$ref" '{target:{type:$t,ref:$r},depth:"full"}')"
-          if [ -n "${LAZ_KEY//[[:space:]]/}" ]; then
+        if [ -s "$list" ] && [ -n "${LAZ_KEY//[[:space:]]/}" ]; then
+          while IFS= read -r line; do
+            [ -z "${line//[[:space:]]/}" ] && continue
+            typ="${line%%:*}"; ref="${line#*:}"
+            count=$((count+1))
+            body="$(jq -n --arg t "$typ" --arg r "$ref" '{target:{type:$t,ref:$r},depth:"full"}')"
             resp="$(curl -fsS -H 'content-type: application/json' -H "x-api-key: ${LAZ_KEY}" -X POST "${BASE_URL}/v1/scan" -d "$body" 2>/dev/null)" || resp='{"verdict":"error"}'
-          else
-            resp='{"verdict":"unscanned"}'
-          fi
-          v="$(printf '%s' "$resp" | jq -r '.verdict // "error"')"
-          n="$(printf '%s' "$resp" | jq -r '(.findings // []) | length')"
-          printf '| `%s:%s` | %s %s | %s |\n' "$typ" "$ref" "$(icon "$v")" "$v" "$n" >> "$rows"
-          echo "lazaretto: ${typ}:${ref} -> ${v} (${n} signals)"
-          r="$(rank "$v")"; if [ "$r" -gt "$worst" ]; then worst="$r"; worst_v="$v"; fi
-        done < "$list"
+            v="$(printf '%s' "$resp" | jq -r '.verdict // "error"')"
+            rk="$(printf '%s' "$resp" | jq -r '.risk // "none"')"
+            n="$(printf '%s' "$resp" | jq -r '(.findings // []) | length')"
+            printf '| `%s` | %s %s | %s | %s |\n' "$ref" "$(icon "$v")" "$v" "$rk" "$n" >> "$rows"
+            echo "lazaretto: ${typ}:${ref} -> ${v} (risk ${rk}, ${n} signals)"
+            r="$(rank "$v")"; if [ "$r" -gt "$worst" ]; then worst="$r"; worst_v="$v"; fi
+          done < "$list"
+        elif [ ! -s "$list" ] && [ -n "${LAZ_KEY//[[:space:]]/}" ]; then
+          echo 'lazaretto: no deep-scan targets. Set the targets input, or add a package-lock.json so exact installed versions can be resolved.'
+          worst_v="unscanned"
+        else
+          worst_v="unscanned"
+        fi
 
-        # Assemble the report (job summary + PR comment share this body).
-        report="$(mktemp)"
+        # ------------------------------------------------------------------
+        # 3) Report.
+        # ------------------------------------------------------------------
         {
-          echo "## $(icon "$worst_v") Lazaretto scan"
+          if [ "$mal_count" -gt 0 ]; then
+            echo "## 🔴 Lazaretto: ${mal_count} known-malicious dependenc$([ "$mal_count" -eq 1 ] && echo y || echo ies)"
+          elif [ "$lock_ran" = "1" ] || [ "$count" -gt 0 ]; then
+            echo "## $(icon "$worst_v") Lazaretto scan"
+          else
+            echo "## ⚫ Lazaretto: nothing checked"
+          fi
           echo
-          echo "| target | verdict | signals |"
-          echo "| --- | --- | --- |"
-          cat "$rows"
+          if [ -s "$lockrows" ]; then
+            echo "### Dependency identity"
+            echo
+            echo "| package | status | advisory |"
+            echo "| --- | --- | --- |"
+            cat "$lockrows"
+            echo
+          fi
+          [ -n "$lock_note" ] && { echo "$lock_note"; echo; }
+          if [ -s "$rows" ]; then
+            echo "### Behavioral scan"
+            echo
+            echo "| target | verdict | risk | signals |"
+            echo "| --- | --- | --- | --- |"
+            cat "$rows"
+            echo
+            echo "Scanned **${count}** target(s). Worst verdict: **${worst_v}**."
+            echo
+          fi
+          echo "Automated signals with evidence, not a warranty. \`clear\` means no known-bad match and no rule fired."
           echo
-          echo "Scanned **${count}** target(s). Worst verdict: **${worst_v}**. Verdicts are automated signals with evidence, not a warranty; the full evidence for each is in the report from the API."
-          echo
-          echo "<sub>Powered by [Lazaretto](${BASE_URL}) · a \`clear\` result means no known-bad match and no rule fired.</sub>"
+          echo "<sub>Powered by [Lazaretto](${BASE_URL}) · the lockfile check is free and needs no API key.</sub>"
         } > "$report"
         [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "malicious-count=${mal_count}" >> "${GITHUB_OUTPUT:-/dev/null}"
+        echo "worst-verdict=${worst_v}" >> "${GITHUB_OUTPUT:-/dev/null}"
 
         # Sticky PR comment (create or update the single Lazaretto comment).
         if [ "${COMMENT}" = "true" ] && [ -n "${GH_TOKEN//[[:space:]]/}" ] && [ -f "${GITHUB_EVENT_PATH:-/nonexistent}" ]; then
@@ -124,8 +222,22 @@ runs:
           fi
         fi
 
-        if [ "$FAIL_ON" != "never" ] && [ "$worst" -ge "$threshold" ] && [ "$threshold" -gt 0 ]; then
+        # ------------------------------------------------------------------
+        # 4) Exit. A pinned dependency that is known malware fails the build at
+        #    any threshold except "never": that is not a heuristic signal to
+        #    weigh, it is a published advisory saying this exact version is
+        #    malware, and it needs no API key to have found.
+        # ------------------------------------------------------------------
+        if [ "$FAIL_ON" = "never" ]; then
+          echo "lazaretto: fail-on=never, not failing the build."
+          exit 0
+        fi
+        if [ "$mal_count" -gt 0 ]; then
+          echo "::error title=Lazaretto::${mal_count} pinned dependenc$([ "$mal_count" -eq 1 ] && echo y is || echo ies are) known malware. Failing the build."
+          exit 1
+        fi
+        if [ "$threshold" -gt 0 ] && [ "$worst" -ge "$threshold" ]; then
           echo "::error title=Lazaretto::Worst verdict '${worst_v}' meets the fail-on threshold '${FAIL_ON}'. Failing the build."
           exit 1
         fi
-        echo "lazaretto: worst verdict '${worst_v}' is below the fail-on threshold '${FAIL_ON}'. OK."
+        echo "lazaretto: nothing at or above the '${FAIL_ON}' threshold. OK."
